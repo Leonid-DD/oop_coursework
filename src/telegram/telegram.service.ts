@@ -1,0 +1,434 @@
+import { Injectable } from '@nestjs/common';
+import TelegramBot from 'node-telegram-bot-api';
+import * as fs from 'fs';
+import * as path from 'path';
+
+interface SpendingRecord {
+  category: string;
+  amount: number;
+  date: Date;
+}
+
+interface SpendingRecordJSON {
+  category: string;
+  amount: number;
+  date: string; // ISO строка вместо Date
+}
+
+interface UserSpendings {
+  spendings: SpendingRecordJSON[];
+}
+
+interface SpendingsData {
+  [userId: string]: UserSpendings;
+}
+
+@Injectable()
+export class TelegramService {
+
+  private bot: TelegramBot;
+  private menuPhases: Map<number,string>;
+  private menuMessages: Map<number, number>;
+
+  private readonly dataFilePath: string;
+
+  // Заменить на хранение в json
+  private temporarySpendings: Map<number, SpendingRecord[]>;
+    
+  constructor() {
+    // Инициализация бота
+    const token = '8500057116:AAHXgxnpWbotTSdB5jbrPoAd23eXJp8sVQU';
+    this.bot = new TelegramBot(token, {polling: true});
+
+    // Инициализация синхронизации меню
+    this.menuPhases = new Map();
+    this.menuMessages = new Map();
+
+    this.temporarySpendings = new Map();
+
+    // Инициализация хранения данных
+    this.dataFilePath = path.join(__dirname, 'spendings_data.json');
+    this.initializeDataFile();
+
+    this.eventHandler()
+  }
+
+  private initializeDataFile(): void {
+    if (!fs.existsSync(this.dataFilePath)) {
+      const initialData: SpendingsData = {};
+      fs.writeFileSync(this.dataFilePath, JSON.stringify(initialData, null, 2), 'utf-8');
+      console.log('Data file created:', this.dataFilePath);
+    }
+  }
+
+  private loadSpendingsData(): SpendingsData {
+    try {
+      const data = fs.readFileSync(this.dataFilePath, 'utf8');
+      return JSON.parse(data);
+    } catch (error) {
+      console.error('Error loading spendings data:', error);
+      return {};
+    }
+  }
+
+  private saveSpendingsData(data: SpendingsData): void {
+    try {
+      fs.writeFileSync(this.dataFilePath, JSON.stringify(data, null, 2), 'utf8');
+    } catch (error) {
+      console.error('Error saving spendings data:', error);
+      throw error;
+    }
+  }
+
+  private addSpendingsToStorage(userId: number, newSpendings: SpendingRecord[]): void {
+    try {
+      const data = this.loadSpendingsData();
+      const userIdStr = userId.toString();
+      
+      if (!data[userIdStr]) {
+        data[userIdStr] = { spendings: [] };
+      }
+      
+      // Преобразуем даты из строк обратно в объекты Date при загрузке
+      const existingSpendings = data[userIdStr].spendings.map(spending => ({
+        ...spending,
+        date: new Date(spending.date)
+      }));
+      
+      // Добавляем новые траты
+      const allSpendings = [...existingSpendings, ...newSpendings];
+      
+      // Сохраняем обратно с преобразованием дат в строки
+      data[userIdStr].spendings = allSpendings.map(spending => ({
+        ...spending,
+        date: spending.date.toISOString() // Сохраняем как ISO строку
+      }));
+      
+      this.saveSpendingsData(data);
+      console.log(`Added ${newSpendings.length} spendings for user ${userId}`);
+      
+    } catch (error) {
+      console.error('Error adding spendings to storage:', error);
+      throw error;
+    }
+  }
+
+  private getUserSpendings(userId: number): SpendingRecord[] {
+    try {
+      const data = this.loadSpendingsData();
+      const userIdStr = userId.toString();
+      
+      if (!data[userIdStr] || !data[userIdStr].spendings) {
+        return [];
+      }
+      
+      // Преобразуем даты из строк обратно в объекты Date
+      return data[userIdStr].spendings.map(spending => ({
+        ...spending,
+        date: new Date(spending.date)
+      }));
+    } catch (error) {
+      console.error('Error getting user spendings:', error);
+      return [];
+    }
+  }
+
+  private eventHandler(): void {
+    this.bot.on('message', (msg) => {
+      try {
+        const id = msg.chat.id;
+        const text = msg.text;
+        if (!text) {
+          throw new Error("text is null");
+        }
+
+        const menuPhase = this.menuPhases.get(id) || '';
+
+        switch (text) {
+          case "/start":
+            this.startCom(id);
+            break;
+          default:
+            if (menuPhase == "spendings") {
+              console.log("spending detected");
+              this.processSpending(id, msg, text);
+            }
+            else {
+              this.deleteUserMessage(id, msg);
+            }
+            break;
+        }
+      }
+      catch (error) {
+        console.log('error ', error);
+      }
+    });
+
+    this.bot.on('callback_query', (query) => {
+      try {
+        const msg = query.message;
+        if (!msg) {
+          throw new Error("msg is null");
+        }
+        const id = msg.chat.id;
+        const button = query.data;
+        
+        console.log(button)
+
+        switch(button) {
+          case 'spendings':
+            this.transferToSpendingsSection(id, msg);
+            break;
+          case 'analytics':
+            this.transferToAnalyticsSection(id, msg);
+            break;
+          case 'returnToMenu':
+            this.returnToMenu(id, msg);
+            break;
+          case 'cancel':
+            this.transferToSpendingsSection(id, msg);
+            break;
+          case 'confirm':
+            this.confirmSpendings(id, msg);
+            break;
+          default:
+            break;
+        }
+
+        this.bot.answerCallbackQuery(query.id);
+      }
+      catch (error) {
+        console.log('error ', error)
+      }
+    });
+  }
+
+  private startCom(id: number): void {
+    this.menuPhases.set(id, 'menu');
+    this.temporarySpendings.delete(id);
+    this.bot.sendMessage(id,'========== Меню ==========', {
+      reply_markup: {
+        inline_keyboard: [[{
+          text: '➕ Добавить траты',
+          callback_data: 'spendings'
+        }],
+        [{
+          text: '📊 Анализ трат',
+          callback_data: 'analytics'
+        }]]
+      }
+    }).then(sentMessage => {
+      this.menuMessages.set(id, sentMessage.message_id);
+    });
+  }
+
+  private transferToSpendingsSection(id: number, msg: TelegramBot.Message): void {
+    this.menuPhases.set(id, 'spendings');
+    this.temporarySpendings.delete(id);
+
+    this.bot.editMessageText("Введите траты в формате 'Категория Сумма'\n\nДобавленные траты:\n(пока нет трат)",
+      {chat_id: id, message_id: msg.message_id,
+        reply_markup: {
+          inline_keyboard: [[{
+            text: '↩️ Вернуться в меню',
+            callback_data: 'returnToMenu'
+        }]]
+    }})
+  }
+
+  private transferToAnalyticsSection(id: number, msg: TelegramBot.Message): void {
+    this.menuPhases.set(id, 'analytics');
+
+    const userSpendings = this.getUserSpendings(id);
+    const totalSavedSpendings = userSpendings.length;
+    const totalAmount = userSpendings.reduce((sum, record) => sum + record.amount, 0);
+    
+    let analyticsText = "📊 *Аналитика трат*\n\n";
+    analyticsText += `Всего сохранено трат: ${totalSavedSpendings}\n`;
+    analyticsText += `Общая сумма: ${totalAmount.toFixed(2)} руб.\n\n`;
+    analyticsText += "Выберите вариант для аналитики:";
+
+    this.bot.editMessageText(analyticsText,
+      {chat_id: id, message_id: msg.message_id,
+        reply_markup: {
+          inline_keyboard: [[{
+            text: '📅 Посмотреть траты за последний месяц',
+            callback_data: 'spendingsLastMonth'}],
+          [{
+            text: '🗂️ Посмотреть траты по всем категориям',
+            callback_data: 'spendingsByCategory'
+          }],
+          // [{
+          //   text: '🔎 Посмотреть траты по выбранной категории',
+          //   callback_data: 'spendingsByCategory'
+          // }],
+          [{
+            text: '↩️ Вернуться в меню',
+            callback_data: 'returnToMenu'
+        }]]
+    }})
+  }
+
+  private returnToMenu(id: number, msg: TelegramBot.Message): void {
+    this.menuPhases.set(id, 'menu');
+    this.temporarySpendings.delete(id);
+
+    this.bot.editMessageText("========== Меню ==========",
+      {chat_id: id, message_id:msg.message_id,
+        reply_markup: {
+        inline_keyboard: [[{
+          text: '➕ Добавить траты',
+          callback_data: 'spendings'
+        }],
+        [{
+          text: '📊 Анализ трат',
+          callback_data: 'analytics'
+        }]]
+      }})
+  }
+
+  private deleteUserMessage(id: number, msg: TelegramBot.Message): void {
+    this.bot.deleteMessage(id, msg.message_id).catch(error => {
+      console.error('Error deleting message: ', error)
+    });
+  }
+
+    private processSpending(id: number, msg: TelegramBot.Message, text: string): void {
+    // Проверяем формат ввода
+    const spendingPattern = /^(\S+)\s+(\d+(?:\.\d{1,2})?)$/;
+    const match = text.match(spendingPattern);
+    
+    const menuMessageId = this.menuMessages.get(id);
+    if (!menuMessageId) {
+      console.error('Menu message ID not found for user', id);
+      this.deleteUserMessage(id, msg);
+      return;
+    }
+
+    if (match) {
+      const [, category, amount] = match;
+      
+      // Создаем запись о трате с датой
+      const spendingRecord: SpendingRecord = {
+        category: category,
+        amount: parseFloat(amount),
+        date: new Date() // Сохраняем текущую дату и время
+      };
+      
+      // Добавляем трату во временное хранилище для данного пользователя
+      if (!this.temporarySpendings.has(id)) {
+        this.temporarySpendings.set(id, []);
+      }
+      const userSpendings = this.temporarySpendings.get(id)!;
+      userSpendings.push(spendingRecord);
+      
+      // Формируем текст с тратами
+      const spendingsText = this.formatSpendingsText(userSpendings);
+      const menuText = `Введите траты в формате 'Категория Сумма'\n\n📋 Добавленные траты:\n${spendingsText}`;
+      
+      // Определяем кнопки в зависимости от количества трат
+      const buttons: { text: string; callback_data: string; }[][] = [];
+      if (userSpendings.length > 0) {
+        buttons.push([
+          { text: '❌ Отмена', callback_data: 'cancel' },
+          { text: '✅ Подтвердить', callback_data: 'confirm' }
+        ],[
+          { text: '↩️ Вернуться в меню', callback_data: 'returnToMenu' }
+        ]);
+      } else {
+        buttons.push([
+          { text: '↩️ Вернуться в меню', callback_data: 'returnToMenu' }
+        ]);
+      }
+      
+      this.bot.editMessageText(menuText, {
+        chat_id: id, message_id: menuMessageId,
+        reply_markup: {
+          inline_keyboard: buttons
+        }
+      }).then(() => {
+        this.deleteUserMessage(id, msg);
+      }).catch(error => {
+        console.error('Error updating menu: ', error)
+      })
+      
+    } else {
+      // Если формат неправильный, удаляем ввод
+      this.deleteUserMessage(id, msg);
+    }
+  }
+
+  private formatSpendingsText(spendings: SpendingRecord[]): string {
+    if (spendings.length === 0) {
+      return "(пока нет трат)";
+    }
+    
+    return spendings.map((record, index) => {
+      const date = record.date.toLocaleDateString('ru-RU');
+      return `${index + 1}. ${record.category}: ${record.amount} руб. (${date})`;
+    }).join('\n');
+  }
+
+  private confirmSpendings(id: number, msg: TelegramBot.Message): void {
+    const userSpendings = this.temporarySpendings.get(id);
+    
+    if (!userSpendings || userSpendings.length === 0) {
+      this.bot.sendMessage(id, "❌ Нет трат для подтверждения");
+      return;
+    }
+       
+    const menuMessageId = this.menuMessages.get(id);
+
+    if (!menuMessageId) {
+      console.error('Menu message ID not found for user', id);
+      this.deleteUserMessage(id, msg);
+      return;
+    }
+
+    try {
+      this.addSpendingsToStorage(id, userSpendings);
+
+      const totalAmount = userSpendings.reduce((sum, record) => sum + record.amount, 0);
+      const spendingsText = this.formatSpendingsText(userSpendings);
+
+      const allUserSpendings = this.getUserSpendings(id);
+      const totalSaved = allUserSpendings.length;
+      const totalSavedAmount = allUserSpendings.reduce((sum, record) => sum + record.amount, 0);
+
+      const successText = `✅ *Траты успешно сохранены*\n\n` +
+        `*Текущие траты:*\n` +
+        `Добавлено: ${userSpendings.length} трат\n` +
+        `Сумма: ${totalAmount.toFixed(2)} руб\.\n\n` +
+        `*Общая статистика:*\n` +
+        `Всего сохранено трат: ${totalSaved}\n` +
+        `Общая сумма: ${totalSavedAmount.toFixed(2)} руб\.\n\n` +
+        `📁 Данные сохранены в файл`;
+
+      this.bot.editMessageText(successText, {
+        chat_id: id, message_id: menuMessageId,
+        reply_markup: {
+          inline_keyboard: [[{
+            text: '↩️ Вернуться в меню',
+            callback_data: 'returnToMenu'
+          }]]
+        }
+      })
+
+      // Очищаем временные траты после подтверждения
+      this.temporarySpendings.delete(id);
+
+    } catch (error) {
+      console.error('Error confirming spendings:', error);
+      
+      this.bot.editMessageText("❌ *Ошибка при сохранении трат*\n\nПожалуйста, попробуйте позже\.", {
+        chat_id: id, message_id: menuMessageId,
+        reply_markup: {
+          inline_keyboard: [[{
+            text: '↩️ Вернуться в меню',
+            callback_data: 'returnToMenu'
+          }]]
+        }
+      });
+    }
+  }
+}
