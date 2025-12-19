@@ -2,56 +2,31 @@ import { Injectable } from '@nestjs/common';
 import TelegramBot from 'node-telegram-bot-api';
 import * as fs from 'fs';
 import * as path from 'path';
-
-interface SpendingRecord {
-  category: string;
-  amount: number;
-  date: Date;
-}
-
-interface SpendingRecordJSON {
-  category: string;
-  amount: number;
-  date: string; // ISO строка вместо Date
-}
-
-interface UserSpendings {
-  spendings: SpendingRecordJSON[];
-}
-
-interface SpendingsData {
-  [userId: string]: UserSpendings;
-}
-
-interface CategoryStats {
-  category: string;
-  totalAmount: number;
-  count: number;
-}
+import { config } from '../config';
+import { SpendingRecord, UserSpendings, SpendingsData, CategoryStats} from './dto/telegram.dto'
 
 @Injectable()
 export class TelegramService {
 
   private bot: TelegramBot;
+
+  // По пользователю тип меню
   private menuPhases: Map<number,string>;
-  private menuMessages: Map<number, number>;
-
-  private readonly dataFilePath: string;
-
   private temporarySpendings: Map<number, SpendingRecord[]>;
-    
+
+  private temporaryUserData: {[userId: number]: UserSpendings} = [];
+  private readonly dataFilePath: string;
+  
   constructor() {
     // Инициализация бота
-    const token = '8500057116:AAHXgxnpWbotTSdB5jbrPoAd23eXJp8sVQU';
+    const token = config.telegramBotToken;
     this.bot = new TelegramBot(token, {polling: true});
 
     // Инициализация синхронизации меню
     this.menuPhases = new Map();
-    this.menuMessages = new Map();
-    this.temporarySpendings = new Map();
 
     // Инициализация хранения данных
-    this.dataFilePath = path.join(__dirname, 'spendings_data.json');
+    this.dataFilePath = path.join('./data', 'spendings_data.json');
     this.initializeDataFile();
 
     this.eventHandler()
@@ -90,13 +65,13 @@ export class TelegramService {
       const userIdStr = userId.toString();
       
       if (!data[userIdStr]) {
-        data[userIdStr] = { spendings: [] };
+        data[userIdStr] = { menuId: 0, spendings: [] };
       }
       
       // Преобразуем даты из строк обратно в объекты Date при загрузке
       const existingSpendings = data[userIdStr].spendings.map(spending => ({
         ...spending,
-        date: new Date(spending.date)
+        date: spending.date
       }));
       
       // Добавляем новые траты
@@ -105,7 +80,7 @@ export class TelegramService {
       // Сохраняем обратно с преобразованием дат в строки
       data[userIdStr].spendings = allSpendings.map(spending => ({
         ...spending,
-        date: spending.date.toISOString() // Сохраняем как ISO строку
+        date: spending.date
       }));
       
       this.saveSpendingsData(data);
@@ -129,7 +104,7 @@ export class TelegramService {
       // Преобразуем даты из строк обратно в объекты Date
       return data[userIdStr].spendings.map(spending => ({
         ...spending,
-        date: new Date(spending.date)
+        date: spending.date
       }));
     } catch (error) {
       console.error('Error getting user spendings:', error);
@@ -216,10 +191,12 @@ export class TelegramService {
     });
   }
 
-  private startCom(id: number): void {
-    this.menuPhases.set(id, 'menu');
-    this.temporarySpendings.delete(id);
-    this.bot.sendMessage(id,'========== Меню ==========', {
+  private async startCom(userId: number): Promise<void> {
+    this.menuPhases.set(userId, 'menu');
+    if (!this.temporaryUserData[userId]) {
+      this.temporaryUserData[userId] = {menuId: 0, spendings: []}
+    }
+    const sentMessage = await this.bot.sendMessage(userId,'========== Меню ==========', {
       reply_markup: {
         inline_keyboard: [[{
           text: '➕ Добавить траты',
@@ -230,17 +207,17 @@ export class TelegramService {
           callback_data: 'analytics'
         }]]
       }
-    }).then(sentMessage => {
-      this.menuMessages.set(id, sentMessage.message_id);
-    });
+    })
+    this.temporaryUserData[userId].menuId = sentMessage.message_id;
   }
 
-  private transferToSpendingsSection(id: number, msg: TelegramBot.Message): void {
-    this.menuPhases.set(id, 'spendings');
-    this.temporarySpendings.delete(id);
+  private transferToSpendingsSection(userId: number, msg: TelegramBot.Message): void {
+    this.menuPhases.set(userId, 'spendings');
+    
+    this.temporaryUserData[userId].spendings = [];
 
     this.bot.editMessageText("Введите траты в формате 'Категория Сумма'\n\nДобавленные траты:\n(пока нет трат)",
-      {chat_id: id, message_id: msg.message_id,
+      {chat_id: userId, message_id: msg.message_id,
         reply_markup: {
           inline_keyboard: [[{
             text: '↩️ Вернуться в меню',
@@ -284,7 +261,8 @@ export class TelegramService {
 
   private returnToMenu(id: number, msg: TelegramBot.Message): void {
     this.menuPhases.set(id, 'menu');
-    this.temporarySpendings.delete(id);
+    // TODO: А надо ли?
+    // this.temporarySpendings.delete(id);
 
     this.bot.editMessageText("========== Меню ==========",
       {chat_id: id, message_id:msg.message_id,
@@ -311,7 +289,7 @@ export class TelegramService {
     const spendingPattern = /^(\S+)\s+(\d+(?:\.\d{1,2})?)$/;
     const match = text.match(spendingPattern);
     
-    const menuMessageId = this.menuMessages.get(id);
+    const menuMessageId = this.temporaryUserData[id].menuId
     if (!menuMessageId) {
       console.error('Menu message ID not found for user', id);
       this.deleteUserMessage(id, msg);
@@ -325,14 +303,14 @@ export class TelegramService {
       const spendingRecord: SpendingRecord = {
         category: category,
         amount: parseFloat(amount),
-        date: new Date() // Сохраняем текущую дату и время
+        date:  new Date().getTime() // Сохраняем текущую дату и время
       };
       
       // Добавляем трату во временное хранилище для данного пользователя
-      if (!this.temporarySpendings.has(id)) {
-        this.temporarySpendings.set(id, []);
-      }
-      const userSpendings = this.temporarySpendings.get(id)!;
+      // if (!this.temporarySpendings.has(id)) {
+      //   this.temporaryUserData[id].spendings = [];
+      // }
+      const userSpendings = this.temporaryUserData[id].spendings;
       userSpendings.push(spendingRecord);
       
       // Формируем текст с тратами
@@ -367,7 +345,40 @@ export class TelegramService {
       
     } else {
       // Если формат неправильный, удаляем ввод
-      this.deleteUserMessage(id, msg);
+      const userSpendings = this.temporaryUserData[id].spendings;
+      
+      // Формируем текст с тратами
+      let spendingsText = ''
+      if (userSpendings) {
+        spendingsText = this.formatSpendingsText(userSpendings);
+      }
+      const menuText = `Введите траты в формате 'Категория Сумма'\n\n📋 Добавленные траты:\n${spendingsText}\n\n❌ Ошибка при добавлении! Введите трату в указаном формате`;
+      
+      // Определяем кнопки в зависимости от количества трат
+      const buttons: { text: string; callback_data: string; }[][] = [];
+      if (userSpendings.length > 0) {
+        buttons.push([
+          { text: '❌ Отмена', callback_data: 'cancel_spendings' },
+          { text: '✅ Подтвердить', callback_data: 'confirm' }
+        ],[
+          { text: '↩️ Вернуться в меню', callback_data: 'returnToMenu' }
+        ]);
+      } else {
+        buttons.push([
+          { text: '↩️ Вернуться в меню', callback_data: 'returnToMenu' }
+        ]);
+      }
+
+      this.bot.editMessageText(menuText, {
+        chat_id: id, message_id: menuMessageId,
+        reply_markup: {
+          inline_keyboard: buttons
+        }
+      }).then(() => {
+        this.deleteUserMessage(id, msg);
+      }).catch(error => {
+        console.error('Error updating menu: ', error)
+      })
     }
   }
 
@@ -377,24 +388,24 @@ export class TelegramService {
     }
     
     return spendings.map((record, index) => {
-      const date = record.date.toLocaleDateString('ru-RU');
+      const date = this.formatDate(record.date);
       return `${index + 1}. ${record.category}: ${record.amount} руб. (${date})`;
     }).join('\n');
   }
 
-  private formatDate(date: Date): string {
-    return date.toLocaleDateString('ru-RU');
+  private formatDate(date: number): string {
+    return new Date(date).toLocaleDateString('ru-RU');
   }
 
   private confirmSpendings(id: number, msg: TelegramBot.Message): void {
-    const userSpendings = this.temporarySpendings.get(id);
+    const userSpendings = this.temporaryUserData[id].spendings;
     
     if (!userSpendings || userSpendings.length === 0) {
       this.bot.sendMessage(id, "❌ Нет трат для подтверждения");
       return;
     }
        
-    const menuMessageId = this.menuMessages.get(id);
+    const menuMessageId = this.temporaryUserData[id].menuId
 
     if (!menuMessageId) {
       console.error('Menu message ID not found for user', id);
@@ -432,7 +443,7 @@ export class TelegramService {
       })
 
       // Очищаем временные траты после подтверждения
-      this.temporarySpendings.delete(id);
+      delete this.temporaryUserData[id];
 
     } catch (error) {
       console.error('Error confirming spendings:', error);
@@ -470,7 +481,7 @@ export class TelegramService {
     const currentYear = now.getFullYear();
     
     const lastMonthSpendings = userSpendings.filter(spending => {
-      const spendingDate = spending.date;
+      const spendingDate = new Date(spending.date);
       return spendingDate.getMonth() === currentMonth && 
              spendingDate.getFullYear() === currentYear;
     });
@@ -502,7 +513,7 @@ export class TelegramService {
     
     // Сортируем по дате (новые сначала)
     const sortedSpendings = [...lastMonthSpendings].sort((a, b) => 
-      b.date.getTime() - a.date.getTime()
+      b.date - a.date
     );
     
     // Группируем по дням
@@ -525,7 +536,7 @@ export class TelegramService {
       resultText += `📆 *${date}* (${daySpendings.length} трат, ${dayTotal.toFixed(2)} руб.)\n`;
       
       daySpendings.forEach((spending, index) => {
-        const time = spending.date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        const time = new Date(spending.date).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
         resultText += `  ${index + 1}. ${spending.category}: ${spending.amount.toFixed(2)} руб. (${time})\n`;
       });
       resultText += '\n';
