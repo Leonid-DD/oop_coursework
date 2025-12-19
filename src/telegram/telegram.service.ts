@@ -23,6 +23,12 @@ interface SpendingsData {
   [userId: string]: UserSpendings;
 }
 
+interface CategoryStats {
+  category: string;
+  totalAmount: number;
+  count: number;
+}
+
 @Injectable()
 export class TelegramService {
 
@@ -32,7 +38,6 @@ export class TelegramService {
 
   private readonly dataFilePath: string;
 
-  // Заменить на хранение в json
   private temporarySpendings: Map<number, SpendingRecord[]>;
     
   constructor() {
@@ -43,7 +48,6 @@ export class TelegramService {
     // Инициализация синхронизации меню
     this.menuPhases = new Map();
     this.menuMessages = new Map();
-
     this.temporarySpendings = new Map();
 
     // Инициализация хранения данных
@@ -185,11 +189,20 @@ export class TelegramService {
           case 'returnToMenu':
             this.returnToMenu(id, msg);
             break;
-          case 'cancel':
+          case 'cancel_spendings':
             this.transferToSpendingsSection(id, msg);
             break;
           case 'confirm':
             this.confirmSpendings(id, msg);
+            break;
+          case 'spendingsLastMonth':
+            this.showLastMonthSpendings(id, msg);
+            break;
+          case 'spendingsByCategory':
+            this.showSpendingsByCategory(id, msg);
+            break;
+          case 'cancel_analytics':
+            this.transferToAnalyticsSection(id, msg);
             break;
           default:
             break;
@@ -252,10 +265,10 @@ export class TelegramService {
       {chat_id: id, message_id: msg.message_id,
         reply_markup: {
           inline_keyboard: [[{
-            text: '📅 Посмотреть траты за последний месяц',
+            text: '📅 Траты за последний месяц',
             callback_data: 'spendingsLastMonth'}],
           [{
-            text: '🗂️ Посмотреть траты по всем категориям',
+            text: '🗂️ Траты по всем категориям',
             callback_data: 'spendingsByCategory'
           }],
           // [{
@@ -330,7 +343,7 @@ export class TelegramService {
       const buttons: { text: string; callback_data: string; }[][] = [];
       if (userSpendings.length > 0) {
         buttons.push([
-          { text: '❌ Отмена', callback_data: 'cancel' },
+          { text: '❌ Отмена', callback_data: 'cancel_spendings' },
           { text: '✅ Подтвердить', callback_data: 'confirm' }
         ],[
           { text: '↩️ Вернуться в меню', callback_data: 'returnToMenu' }
@@ -367,6 +380,10 @@ export class TelegramService {
       const date = record.date.toLocaleDateString('ru-RU');
       return `${index + 1}. ${record.category}: ${record.amount} руб. (${date})`;
     }).join('\n');
+  }
+
+  private formatDate(date: Date): string {
+    return date.toLocaleDateString('ru-RU');
   }
 
   private confirmSpendings(id: number, msg: TelegramBot.Message): void {
@@ -430,5 +447,172 @@ export class TelegramService {
         }
       });
     }
+  }
+
+  private showLastMonthSpendings(id: number, msg: TelegramBot.Message): void {
+    const userSpendings = this.getUserSpendings(id);
+    
+    if (userSpendings.length === 0) {
+      this.bot.editMessageText("📭 *Нет сохраненных трат*\n\nУ вас пока нет ни одной сохраненной траты.", {
+        chat_id: id, message_id: msg.message_id,
+        reply_markup: {
+          inline_keyboard: [[{
+            text: '↩️ Назад к аналитике',
+            callback_data: 'cancel_analytics'
+          }]]
+        }
+      });
+      return;
+    }
+    
+    const now = new Date();
+    const currentMonth = now.getMonth();
+    const currentYear = now.getFullYear();
+    
+    const lastMonthSpendings = userSpendings.filter(spending => {
+      const spendingDate = spending.date;
+      return spendingDate.getMonth() === currentMonth && 
+             spendingDate.getFullYear() === currentYear;
+    });
+    
+    if (lastMonthSpendings.length === 0) {
+      const monthNames = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+                         'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+      
+      this.bot.editMessageText(`📭 *Нет трат за текущий месяц*\n\nЗа ${monthNames[currentMonth]} ${currentYear} трат не обнаружено.`, {
+        chat_id: id, message_id: msg.message_id,
+        reply_markup: {
+          inline_keyboard: [[{
+            text: '↩️ Назад к аналитике',
+            callback_data: 'cancel_analytics'
+          }]]
+        }
+      });
+      return;
+    }
+    
+    const totalAmount = lastMonthSpendings.reduce((sum, record) => sum + record.amount, 0);
+    
+    const monthNames = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+                       'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+    
+    let resultText = `📅 *Траты за ${monthNames[currentMonth]} ${currentYear}*\n\n`;
+    resultText += `Всего трат: ${lastMonthSpendings.length}\n`;
+    resultText += `Общая сумма: ${totalAmount.toFixed(2)} руб.\n\n`;
+    
+    // Сортируем по дате (новые сначала)
+    const sortedSpendings = [...lastMonthSpendings].sort((a, b) => 
+      b.date.getTime() - a.date.getTime()
+    );
+    
+    // Группируем по дням
+    const spendingsByDay: { [key: string]: SpendingRecord[] } = {};
+    sortedSpendings.forEach(spending => {
+      const dateKey = this.formatDate(spending.date);
+      if (!spendingsByDay[dateKey]) {
+        spendingsByDay[dateKey] = [];
+      }
+      spendingsByDay[dateKey].push(spending);
+    });
+    
+    // Выводим траты по дням
+    Object.keys(spendingsByDay).sort((a, b) => 
+      new Date(b).getTime() - new Date(a).getTime()
+    ).forEach(date => {
+      const daySpendings = spendingsByDay[date];
+      const dayTotal = daySpendings.reduce((sum, record) => sum + record.amount, 0);
+      
+      resultText += `📆 *${date}* (${daySpendings.length} трат, ${dayTotal.toFixed(2)} руб.)\n`;
+      
+      daySpendings.forEach((spending, index) => {
+        const time = spending.date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        resultText += `  ${index + 1}. ${spending.category}: ${spending.amount.toFixed(2)} руб. (${time})\n`;
+      });
+      resultText += '\n';
+    });
+    
+    this.bot.editMessageText(resultText, {
+      chat_id: id, message_id: msg.message_id,
+      reply_markup: {
+        inline_keyboard: [[{
+          text: '↩️ Назад к аналитике',
+          callback_data: 'cancel_analytics'
+        }]]
+      }
+    });
+  }
+
+  private showSpendingsByCategory(id: number, msg: TelegramBot.Message): void {
+    const userSpendings = this.getUserSpendings(id);
+    
+    if (userSpendings.length === 0) {
+      this.bot.editMessageText("📭 *Нет сохраненных трат*\n\nУ вас пока нет ни одной сохраненной траты.", {
+        chat_id: id, message_id: msg.message_id,
+        reply_markup: {
+          inline_keyboard: [[{
+            text: '↩️ Назад к аналитике',
+            callback_data: 'cancel_analytics'
+          }]]
+        }
+      });
+      return;
+    }
+    
+    // Группируем по категориям
+    const categoryStats: { [key: string]: CategoryStats } = {};
+    
+    userSpendings.forEach(spending => {
+      if (!categoryStats[spending.category]) {
+        categoryStats[spending.category] = {
+          category: spending.category,
+          totalAmount: 0,
+          count: 0
+        };
+      }
+      categoryStats[spending.category].totalAmount += spending.amount;
+      categoryStats[spending.category].count++;
+    });
+    
+    // Сортируем по общей сумме (по убыванию)
+    const sortedCategories = Object.values(categoryStats).sort((a, b) => b.totalAmount - a.totalAmount);
+    
+    const totalAmount = userSpendings.reduce((sum, record) => sum + record.amount, 0);
+    const totalCount = userSpendings.length;
+    
+    let resultText = `🗂️ *Траты по категориям (все время)*\n\n`;
+    resultText += `Всего трат: ${totalCount}\n`;
+    resultText += `Общая сумма: ${totalAmount.toFixed(2)} руб.\n\n`;
+    
+    // Выводим категории с суммами
+    sortedCategories.forEach((stat, index) => {
+      const percentage = ((stat.totalAmount / totalAmount) * 100).toFixed(1);
+      const rankEmoji = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `${index + 1}.`;
+      
+      resultText += `${rankEmoji} *${stat.category}*\n`;
+      resultText += `   Количество трат: ${stat.count}\n`;
+      resultText += `   Общая сумма: ${stat.totalAmount.toFixed(2)} руб.\n`;
+      resultText += `   Доля от общих трат: ${percentage}%\n\n`;
+    });
+    
+    // Добавляем итоговую статистику
+    const averagePerCategory = totalAmount / sortedCategories.length;
+    const mostExpensiveCategory = sortedCategories[0];
+    const leastExpensiveCategory = sortedCategories[sortedCategories.length - 1];
+    
+    resultText += `📊 *Статистика:*\n`;
+    resultText += `• Всего категорий: ${sortedCategories.length}\n`;
+    resultText += `• Средняя сумма на категорию: ${averagePerCategory.toFixed(2)} руб.\n`;
+    resultText += `• Самая затратная категория: ${mostExpensiveCategory.category} (${mostExpensiveCategory.totalAmount.toFixed(2)} руб.)\n`;
+    resultText += `• Наименее затратная категория: ${leastExpensiveCategory.category} (${leastExpensiveCategory.totalAmount.toFixed(2)} руб.)\n`;
+    
+    this.bot.editMessageText(resultText, {
+      chat_id: id, message_id: msg.message_id,
+      reply_markup: {
+        inline_keyboard: [[{
+          text: '↩️ Назад к аналитике',
+          callback_data: 'cancel_analytics'
+        }]]
+      }
+    });
   }
 }
