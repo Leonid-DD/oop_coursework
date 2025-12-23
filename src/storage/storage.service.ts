@@ -39,7 +39,11 @@ export class StorageService {
       const data = this.loadSpendingsData();
       const oldUserInfo = data[userId]
       const newSpendings = userInfo.spendings.length
-      userInfo.spendings = [...oldUserInfo.spendings, ...userInfo.spendings]
+      if (oldUserInfo) {
+        userInfo.spendings = [...oldUserInfo.spendings, ...userInfo.spendings]
+      } else {
+        userInfo.spendings = [...userInfo.spendings]
+      }
       data[userId] = userInfo
       this.saveSpendingsData(data);
       console.log(`Added ${newSpendings} spendings for user ${userId}`);
